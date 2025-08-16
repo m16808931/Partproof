@@ -12,10 +12,17 @@
 (define-constant ERR_INVALID_CLAIM_STATUS (err u110))
 (define-constant ERR_INVALID_WARRANTY_DURATION (err u111))
 (define-constant ERR_CLAIM_ALREADY_EXISTS (err u112))
+(define-constant ERR_RATING_NOT_FOUND (err u113))
+(define-constant ERR_INVALID_RATING_SCORE (err u114))
+(define-constant ERR_RATING_ALREADY_EXISTS (err u115))
+(define-constant ERR_NOT_PART_OWNER (err u116))
+(define-constant ERR_RATING_TOO_EARLY (err u117))
+(define-constant ERR_INVALID_RATING_CATEGORY (err u118))
 
 (define-data-var next-part-id uint u1)
 (define-data-var next-warranty-id uint u1)
 (define-data-var next-claim-id uint u1)
+(define-data-var next-rating-id uint u1)
 
 (define-map manufacturers
     principal
@@ -108,6 +115,61 @@
 (define-map manufacturer-warranty-claims
     principal
     (list 500 uint)
+)
+
+(define-map part-ratings
+    uint
+    {
+        rating-id: uint,
+        part-id: uint,
+        rater: principal,
+        overall-score: uint,
+        durability-score: uint,
+        performance-score: uint,
+        value-score: uint,
+        category: (string-ascii 30),
+        review-text: (string-ascii 300),
+        usage-duration: uint,
+        verified: bool,
+        rating-date: uint,
+        helpful-votes: uint,
+        total-votes: uint
+    }
+)
+
+(define-map part-rating-aggregates
+    uint
+    {
+        total-ratings: uint,
+        average-overall: uint,
+        average-durability: uint,
+        average-performance: uint,
+        average-value: uint,
+        total-score-sum: uint,
+        last-updated: uint,
+        verified-ratings-count: uint
+    }
+)
+
+(define-map manufacturer-rating-summary
+    principal
+    {
+        total-parts-rated: uint,
+        total-ratings: uint,
+        average-rating: uint,
+        last-updated: uint,
+        reputation-score: uint
+    }
+)
+
+(define-map user-part-ratings
+    { user: principal, part-id: uint }
+    uint
+)
+
+(define-map rating-helpfulness
+    { rating-id: uint, voter: principal }
+    bool
 )
 
 (define-public (register-manufacturer (name (string-ascii 50)))
@@ -502,3 +564,249 @@
 (define-read-only (get-next-claim-id)
     (var-get next-claim-id)
 )
+
+(define-public (submit-part-rating 
+    (part-id uint)
+    (overall-score uint)
+    (durability-score uint)
+    (performance-score uint)
+    (value-score uint)
+    (category (string-ascii 30))
+    (review-text (string-ascii 300))
+    (usage-duration uint))
+    (let
+        (
+            (rating-id (var-get next-rating-id))
+            (part-info (map-get? parts part-id))
+            (ownership-info (map-get? part-ownership part-id))
+            (existing-rating (map-get? user-part-ratings { user: tx-sender, part-id: part-id }))
+        )
+        (asserts! (is-some part-info) ERR_PART_NOT_FOUND)
+        (asserts! (is-some ownership-info) ERR_PART_NOT_FOUND)
+        (asserts! (is-none existing-rating) ERR_RATING_ALREADY_EXISTS)
+        (asserts! (and (<= overall-score u10) (>= overall-score u1)) ERR_INVALID_RATING_SCORE)
+        (asserts! (and (<= durability-score u10) (>= durability-score u1)) ERR_INVALID_RATING_SCORE)
+        (asserts! (and (<= performance-score u10) (>= performance-score u1)) ERR_INVALID_RATING_SCORE)
+        (asserts! (and (<= value-score u10) (>= value-score u1)) ERR_INVALID_RATING_SCORE)
+        
+        (let 
+            (
+                (ownership-data (unwrap-panic ownership-info))
+                (part-data (unwrap-panic part-info))
+                (is-current-owner (is-eq (get current-owner ownership-data) tx-sender))
+                (is-previous-owner (is-some (index-of (get previous-owners ownership-data) tx-sender)))
+                (can-rate (or is-current-owner is-previous-owner))
+                (min-ownership-duration u1440)
+            )
+            (asserts! can-rate ERR_NOT_PART_OWNER)
+            (asserts! (>= usage-duration min-ownership-duration) ERR_RATING_TOO_EARLY)
+            
+            (map-set part-ratings rating-id {
+                rating-id: rating-id,
+                part-id: part-id,
+                rater: tx-sender,
+                overall-score: overall-score,
+                durability-score: durability-score,
+                performance-score: performance-score,
+                value-score: value-score,
+                category: category,
+                review-text: review-text,
+                usage-duration: usage-duration,
+                verified: (get verified part-data),
+                rating-date: stacks-block-height,
+                helpful-votes: u0,
+                total-votes: u0
+            })
+            
+            (map-set user-part-ratings { user: tx-sender, part-id: part-id } rating-id)
+            (unwrap-panic (update-part-rating-aggregate part-id overall-score durability-score performance-score value-score (get verified part-data)))
+            (unwrap-panic (update-manufacturer-rating-summary (get manufacturer part-data) overall-score))
+            
+            (var-set next-rating-id (+ rating-id u1))
+            (ok rating-id)
+        )
+    )
+)
+
+(define-public (vote-rating-helpfulness (rating-id uint) (helpful bool))
+    (let
+        (
+            (rating-info (map-get? part-ratings rating-id))
+            (existing-vote (map-get? rating-helpfulness { rating-id: rating-id, voter: tx-sender }))
+        )
+        (asserts! (is-some rating-info) ERR_RATING_NOT_FOUND)
+        (asserts! (is-none existing-vote) ERR_RATING_ALREADY_EXISTS)
+        
+        (let ((rating-data (unwrap-panic rating-info)))
+            (map-set rating-helpfulness { rating-id: rating-id, voter: tx-sender } helpful)
+            
+            (let 
+                (
+                    (new-total-votes (+ (get total-votes rating-data) u1))
+                    (new-helpful-votes (if helpful (+ (get helpful-votes rating-data) u1) (get helpful-votes rating-data)))
+                )
+                (map-set part-ratings rating-id (merge rating-data {
+                    helpful-votes: new-helpful-votes,
+                    total-votes: new-total-votes
+                }))
+                (ok true)
+            )
+        )
+    )
+)
+
+(define-private (update-part-rating-aggregate 
+    (part-id uint) 
+    (overall-score uint) 
+    (durability-score uint) 
+    (performance-score uint) 
+    (value-score uint)
+    (verified bool))
+    (let
+        (
+            (current-aggregate (default-to 
+                {
+                    total-ratings: u0,
+                    average-overall: u0,
+                    average-durability: u0,
+                    average-performance: u0,
+                    average-value: u0,
+                    total-score-sum: u0,
+                    last-updated: u0,
+                    verified-ratings-count: u0
+                }
+                (map-get? part-rating-aggregates part-id)
+            ))
+        )
+        (let 
+            (
+                (new-total-ratings (+ (get total-ratings current-aggregate) u1))
+                (new-total-score-sum (+ (get total-score-sum current-aggregate) overall-score))
+                (new-verified-count (if verified (+ (get verified-ratings-count current-aggregate) u1) (get verified-ratings-count current-aggregate)))
+                (new-avg-overall (/ new-total-score-sum new-total-ratings))
+                (new-avg-durability (/ (+ (* (get average-durability current-aggregate) (get total-ratings current-aggregate)) durability-score) new-total-ratings))
+                (new-avg-performance (/ (+ (* (get average-performance current-aggregate) (get total-ratings current-aggregate)) performance-score) new-total-ratings))
+                (new-avg-value (/ (+ (* (get average-value current-aggregate) (get total-ratings current-aggregate)) value-score) new-total-ratings))
+            )
+            (map-set part-rating-aggregates part-id {
+                total-ratings: new-total-ratings,
+                average-overall: new-avg-overall,
+                average-durability: new-avg-durability,
+                average-performance: new-avg-performance,
+                average-value: new-avg-value,
+                total-score-sum: new-total-score-sum,
+                last-updated: stacks-block-height,
+                verified-ratings-count: new-verified-count
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-private (update-manufacturer-rating-summary (manufacturer principal) (rating uint))
+    (let
+        (
+            (current-summary (default-to 
+                {
+                    total-parts-rated: u0,
+                    total-ratings: u0,
+                    average-rating: u0,
+                    last-updated: u0,
+                    reputation-score: u0
+                }
+                (map-get? manufacturer-rating-summary manufacturer)
+            ))
+        )
+        (let 
+            (
+                (new-total-ratings (+ (get total-ratings current-summary) u1))
+                (new-avg-rating (/ (+ (* (get average-rating current-summary) (get total-ratings current-summary)) rating) new-total-ratings))
+                (new-reputation-score (calculate-reputation-score new-avg-rating new-total-ratings))
+            )
+            (map-set manufacturer-rating-summary manufacturer {
+                total-parts-rated: (get total-parts-rated current-summary),
+                total-ratings: new-total-ratings,
+                average-rating: new-avg-rating,
+                last-updated: stacks-block-height,
+                reputation-score: new-reputation-score
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-private (calculate-reputation-score (avg-rating uint) (total-ratings uint))
+    (let 
+        (
+            (base-score (* avg-rating u10))
+            (volume-bonus (if (>= total-ratings u50) u20 (if (>= total-ratings u20) u10 (if (>= total-ratings u10) u5 u0))))
+        )
+        (+ base-score volume-bonus)
+    )
+)
+
+(define-public (flag-rating (rating-id uint) (reason (string-ascii 100)))
+    (let
+        (
+            (rating-info (map-get? part-ratings rating-id))
+        )
+        (asserts! (is-some rating-info) ERR_RATING_NOT_FOUND)
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        
+        (let ((rating-data (unwrap-panic rating-info)))
+            (map-set part-ratings rating-id (merge rating-data { verified: false }))
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-part-rating (rating-id uint))
+    (map-get? part-ratings rating-id)
+)
+
+(define-read-only (get-part-rating-aggregate (part-id uint))
+    (map-get? part-rating-aggregates part-id)
+)
+
+(define-read-only (get-manufacturer-rating-summary (manufacturer principal))
+    (map-get? manufacturer-rating-summary manufacturer)
+)
+
+(define-read-only (get-user-rating-for-part (user principal) (part-id uint))
+    (match (map-get? user-part-ratings { user: user, part-id: part-id })
+        rating-id (map-get? part-ratings rating-id)
+        none
+    )
+)
+
+(define-read-only (has-user-rated-part (user principal) (part-id uint))
+    (is-some (map-get? user-part-ratings { user: user, part-id: part-id }))
+)
+
+(define-read-only (get-rating-helpfulness-vote (rating-id uint) (voter principal))
+    (map-get? rating-helpfulness { rating-id: rating-id, voter: voter })
+)
+
+(define-read-only (calculate-part-quality-score (part-id uint))
+    (match (map-get? part-rating-aggregates part-id)
+        aggregate-data (let 
+            (
+                (base-score (get average-overall aggregate-data))
+                (verified-bonus (if (>= (get verified-ratings-count aggregate-data) u3) u1 u0))
+                (volume-bonus (if (>= (get total-ratings aggregate-data) u10) u1 u0))
+            )
+            (+ base-score verified-bonus volume-bonus)
+        )
+        u0
+    )
+)
+
+(define-read-only (get-top-rated-manufacturer-parts (manufacturer principal) (min-rating uint))
+    (default-to (list) (map-get? manufacturer-parts manufacturer))
+)
+
+(define-read-only (get-next-rating-id)
+    (var-get next-rating-id)
+)
+
+
