@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Partproof.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.recall-manager]
+path = 'contracts/recall-manager.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
